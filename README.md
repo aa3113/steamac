@@ -82,6 +82,30 @@ settings stays. Launcher 1.4 shipped both settings off (`"DisableShaderCache" "1
 `"EnableShaderBackgroundProcessing" "0"`); on the first Steam start after updating, the script turns
 both back on once, but only if both are still exactly those values.
 
+Per-title environment that a game needs from the driver it runs on is a default, not code:
+`/usr/lib/steamac/steam-title-defaults` (also an ExecStartPre of `steam.service`) puts the required
+`VAR=value` words in front of a title's Steam launch options (`%command%`). It ships one entry:
+Dragon's Dogma 2 (2054970) asks for D3D feature level 12_1, which vkd3d-proton derives from ROVs and
+conservative rasterization — on Metal neither exists (conservative rasterization has no Metal API;
+ROVs would need Metal's raster order groups mapped to `VK_EXT_fragment_shader_interlock`), and the
+title only checks the level, so it is reported as `VKD3D_FEATURE_LEVEL=12_1 VKD3D_SHADER_MODEL=6_6`,
+together with `VKD3D_DISABLE_EXTENSIONS=` (empty). KosmicKrisp's 64-bit atomics cover unsigned
+min/max only, so `steam.service` keeps `VK_KHR_shader_atomic_int64` and
+`VK_EXT_shader_image_atomic_int64` from every D3D12 title by default
+(`Environment=VKD3D_DISABLE_EXTENSIONS=…` in its drop-in; a title whose shaders use another 64-bit
+atomic would silently lose those pipelines, and vkd3d-proton reports shader model 6.6 from them), and
+a title that fits gets them back in its own launch options. The default is Steam's inherited
+environment, not a `gfx.txt` line: `steam-launch-wrapper` sets every variable of
+`$XDG_RUNTIME_DIR/steam/env/gfx.txt` and then `~/.config/steam/env/gfx.txt` over the game's
+environment, launch options included, so a `VKD3D_DISABLE_EXTENSIONS` written there wins for every
+title. An entry applies only where the Venus device advertises the features it needs (DD2's: the
+64-bit atomics, Apple8/M2 and later) and is taken back, restoring the previous launch options, when
+a later Steam start finds them gone (driver switched to MoltenVK, disk moved to an M1); a failed
+probe changes nothing. An existing value is only prefixed, never replaced, a value without
+`%command%` is left alone, and an edit made in Steam after ours wins (marker
+`~/.config/steamac/title-defaults.json`, which also keeps the previous value).
+Profile `env` words override the built-in entry; without a profile override, DD2 keeps the feature-gated default.
+
 SteamOS takes the Mac's time zone and 12/24-hour clock format (Settings > General
 **Use the Mac's time zone and clock format**, on by default, applies on the next start).
 On every boot the launcher adds `steamac.tz=<IANA zone of the Mac>` (`TimeZone.current`) and
@@ -141,7 +165,10 @@ start over.
 | Ctrl+Option | release the captured mouse |
 | close window | shut down the guest (power button) |
 
-Mouse (`--mouse auto`, by default): the SteamOS cursor follows the Mac cursor precisely. gamescope
+Mouse (`--mouse auto`, by default): the SteamOS cursor follows the Mac cursor precisely, and the Mac
+cursor is hidden over the picture so only gamescope's cursor shows (it reappears over the black bars,
+the clickable progress pill and "Report…" link, menus and other windows, while booting, paused or
+asleep, and outside the window). gamescope
 (gaming mode) does not accept absolute coordinates, so the launcher moves it with relative deltas
 without acceleration, in pixels of the surface gamescope shows: the agent sends its size with each
 focus line (`focus steam 1920x1200` when Steam's Settings > Display > Resolution is not the native
@@ -229,8 +256,8 @@ over saved values, but only for that launch: the field displays “overridden by
 | Mouse | auto-capture in games; game list (name from `appmanifest_<appid>.acf`, Default/Auto/Off, remove) | — |
 | Controller | which physical controller (GameController) drives the virtual pad (first connected or selected), whether SteamOS gets a pad and what it appears as (`--no-gamepad`, `--pad`, see “Controller”), whether a DualSense is passed through as itself, whether further controllers are players 2–4, swap A/B and X/Y, stick dead zone, live input test | — |
 | Sound | output device (System default follows macOS, or a specific CoreAudio device), volume/mute, Low/Normal/Safe buffer — via `krun_snd_set_*` (looked up with `dlsym`; with an older libkrun the fields are disabled with an explanation) | sound (`--no-sound`) |
-| Games | **Share game statistics** (off until you agree, see “Game statistics”); every game with recorded sessions: sessions, play time, last session's FPS / 1% low / game memory / Vulkan driver, your optional rating (Runs well / Playable with issues / Starts, but unplayable / Does not start) and a per-game **Share** switch | — |
-| Advanced | — | vCPU (`--cpus`), RAM (`--mem`), SSH enable/disable + port (`--ssh-port`, `--no-ssh`) and generated password, network (`--no-net`), disk image (`--disk`), Create New Disk…, Steam client (`--steam-client`, see “Steam client”), Vulkan driver (`--vulkan-driver`, see “Vulkan driver”), D3D11 on the Mac's Metal (wmtr), experimental (`--wmtr-lib`, `--no-wmtr`, see “Vulkan driver”) |
+| Games | **Share game statistics** (off until you agree, see “Game statistics”); known games and games with recorded sessions: per-game profiles (graphics, Vulkan driver, launch options; see below), sessions, play time, last session's FPS / 1% low / game memory / Vulkan driver, your optional rating (Runs well / Playable with issues / Starts, but unplayable / Does not start) and a per-game **Share** switch | profiles may require restarting Steam or the VM (see below) |
+| Advanced | — | vCPU (`--cpus`), RAM (`--mem`), SSH enable/disable + port (`--ssh-port`, `--no-ssh`) and generated password, network (`--no-net`), disk image (`--disk`), Create New Disk…, Steam client (`--steam-client`, see “Steam client”), Vulkan driver (`--vulkan-driver`, see “Vulkan driver”), Allow DXMT (D3D11 on the Mac's Metal), experimental (`--wmtr-lib`, `--no-wmtr`, see “Vulkan driver”) |
 
 **VM RAM and graphics share the Mac's memory.** Automatic VM RAM is half of physical RAM
 (4–16 GiB). On every boot the launcher also reserves at least 3 GiB, or a quarter of host RAM,
@@ -263,6 +290,49 @@ free space first. Terminal, with SteamOS stopped:
 For tests: `STEAMAC_DEFAULTS_DOMAIN=<domain>` substitutes the settings domain; `--selftest-settings
 --selftest-out DIR` opens the window without a VM and writes a PNG of each tab; `--control-fifo` has
 `settings TAB`, `settings-dump PNG`, `set KEY VALUE` (as from the window), `restart`.
+
+### Per-game profiles
+
+**Settings → Games** stores a profile per Steam app id, separately from mouse auto-capture:
+**Graphics** — Default (= Vulkan) / Vulkan / DXMT; **Vulkan driver** — Default (the global driver) /
+KosmicKrisp / MoltenVK (only available drivers are offered); **Launch options** — space-separated
+`NAME=value` words placed before `%command%`, not arbitrary shell commands. The whole string is
+limited to 256 characters. Names use the prefixes `VKD3D_`, `DXVK_`, `PROTON_`, `WINE_`, `MESA_`,
+`RADV_`, `VK_`, `DXMT_`, `MTL_`, `STEAMAC_`, followed by zero or more `[A-Z0-9_]` characters;
+values match `[A-Za-z0-9_.,:;+-]*` (empty is allowed). Assignments are sorted by name; the last
+duplicate name wins. Invalid input stays visible with an error and is not saved or sent.
+
+**Recommended: … — Apply** fetches a profile from the statistics service using this Mac's **My Mac**
+limits (GPU cores, RAM and performance cores no greater than this Mac's). Configurations are ranked
+by `(runs well + 0.5 × playable with issues) / all ratings`, then higher launch success and fewer
+early exits; at least two distinct installs are required (details in “Game statistics”).
+Recommendations are never automatic: only **Apply** changes the profile.
+
+DXMT requires **Settings → Advanced → Allow DXMT (D3D11 on the Mac's Metal)** and a VM boot with
+that permission. While it is off, a DXMT profile is shown as not in effect and offers **Allow DXMT…**
+with the existing security warning; it cannot map a game to Proton 10.0 on a Vulkan-only boot.
+The Vulkan driver is selected **per VM boot**, not per process. When a game starts or gains focus
+with another profile driver, the launcher offers to restart the VM with that driver and relaunch
+the game once Steam is ready. This one-shot override does not change the global driver setting.
+
+Profiles travel over the bidirectional `fx.progress` port (one line per message). Host → guest:
+`profiles <base64 of UTF-8 JSON>` replaces the full set on the first agent heartbeat/ready of a boot
+and after changes; `launch <appid>` starts `steam steam://rungameid/<appid>` as the session user;
+`restart-steam` restarts `steam.service` only after the user agrees. The profile payload is
+`{"v":1,"games":{"570":{"gfx":"dxmt","env":"PROTON_LOG=1"}}}`; default/empty fields are omitted,
+and `driver` stays host-side. The guest atomically persists it in
+`~/.config/steamac/game-profiles.json`. Before graphics/title preparation, the `steam-profiles-wait`
+ExecStartPre waits up to 5 s for this boot's synchronization, then snapshots the latest available
+set (using the persisted file on timeout). Guest → host: `profiles-ok <sha256 of JSON> applied|pending`;
+`pending` means Steam is running with a different applied set and the launcher offers **Restart Steam**
+or **Later**. `game-gfx <appid> dxmt|vulkan` follows `game-proton` and describes the actual Proton
+graphics path, detected from its `.steamac-dxmt` marker rather than the boot permission.
+Unknown verbs remain ignored so old/new host/guest combinations work.
+
+On Steam start, profile launch words override `steam-title-defaults`' built-in entry; with no
+profile `env`, Dragon's Dogma 2 retains its Venus-feature-gated default. Ownership is unchanged:
+a later user edit in Steam wins; replacing or removing steamac-owned words does not accumulate
+old assignments, and removal restores the previous launch options.
 
 ## Suspend
 
@@ -655,15 +725,15 @@ verifies actual Metal source compilation with the replacement (no VM or Sentry e
 
 | Option | What it is | Pros and cons |
 |---|---|---|
-| **KosmicKrisp** — Mesa on Metal 4 · macOS 26+ (`kosmickrisp`, default where available) | `host/kosmickrisp/`: Mesa main + open MRs (geometry shaders !44786, transform feedback !44928, tiled images in host-pointer memory !44929, device-local memory type !44221, linear render targets !44782/!44222) + steamac's patches (explicit LINEAR row pitch, LINEAR input attachments, `fillModeNonSolid`, which DXVK requires, 8-sample requests as 4, single texel alignment for texel buffers and timestamp pools over several Metal counter heaps, which vkd3d-proton requires; R32G32B32 uniform texel buffers, as which vkd3d-proton views 12-byte structured buffers (such a view crashed the VM in The Witcher 3, STEAMAC-2Z); one Metal compiler shared by all guest devices, also on macOS 27 (on its betas 1–4 a compiler per device corrupted the heap when a guest session started, STEAMAC-31); texel buffer views of zero or more than Metal's 2^28 texels fail with a Vulkan error instead of aborting the VM in Metal validation (Spider-Man, Uncharted, Forza Horizon 6, STEAMAC-3J/3F/3S/3R), and buffer-backed texel buffer views share their buffer's residency (over ~1M views exhausted the residency set and aborted, DOOM, Wolfenstein, STEAMAC-3V/3T); occlusion queries past one 32768-entry visibility buffer and timestamp pools on counter heaps shared by every guest device of the process (Metal allows 32 per process), so query pools of Dota 2 / Counter-Strike 2 no longer fail to create; sparse binding/residency on Metal 4 placement sparse resources and sampler min/max reduction emulated in shaders before Apple10, which give vkd3d-proton Tiled Resources Tier 2 and so D3D12 feature level 12_0) | faster: Stellar Blade Demo ~29 FPS against ~18 on MoltenVK on an M1 Max (split-screen video: `docs/media/stellar-blade-moltenvk-vs-kosmickrisp.mp4`); Steam UI, DXVK games and Stellar Blade Demo (D3D12, vkd3d-proton) run, its first run spends ~28 min compiling shaders on an M1 Max. macOS 26+ only; built only when the build host runs macOS 26+, otherwise MoltenVK is used. Known gaps (host repros): transform feedback with strip geometry shaders and its overflow counter (draft MR); within one render pass, depth writes to unmapped tiles stay in tile memory and later draws of the pass test against them (Tiled Resources Tier 2 allows this cache; vkd3d-proton's `test_sparse_depth_stencil_rendering` expects them dropped); no sparse 3D textures (Metal's 3D tiles are not Vulkan's standard 3D blocks), hence no Tiled Resources Tier 3 |
+| **KosmicKrisp** — Mesa on Metal 4 · macOS 26+ (`kosmickrisp`, default where available) | `host/kosmickrisp/`: Mesa main + open MRs (geometry shaders !44786, transform feedback !44928, tiled images in host-pointer memory !44929, device-local memory type !44221, linear render targets !44782/!44222) + steamac's patches (explicit LINEAR row pitch, LINEAR input attachments, `fillModeNonSolid`, which DXVK requires, 8-sample requests as 4, single texel alignment for texel buffers and timestamp pools over several Metal counter heaps, which vkd3d-proton requires; R32G32B32 uniform texel buffers, as which vkd3d-proton views 12-byte structured buffers (such a view crashed the VM in The Witcher 3, STEAMAC-2Z); one Metal compiler shared by all guest devices, also on macOS 27 (on its betas 1–4 a compiler per device corrupted the heap when a guest session started, STEAMAC-31); zero-element texel buffer views become null descriptors and oversized views are clamped to Metal's per-format capacity after alignment (2^28 texels, three per RGB32 element), not to the conservative advertised limit: no invalid width reaches Metal and no asynchronous Venus creation failure kills the guest at first use (Spider-Man, Uncharted, Forza Horizon 6, Dragon's Dogma 2, STEAMAC-3J/3F/3S/3R); buffer-backed texel buffer views share their buffer's residency (over ~1M views exhausted the residency set and aborted, DOOM, Wolfenstein, STEAMAC-3V/3T); occlusion queries past one 32768-entry visibility buffer and timestamp pools on counter heaps shared by every guest device of the process (Metal allows 32 per process), so query pools of Dota 2 / Counter-Strike 2 no longer fail to create; sparse binding/residency on Metal 4 placement sparse resources and sampler min/max reduction emulated in shaders before Apple10, which give vkd3d-proton Tiled Resources Tier 2 and so D3D12 feature level 12_0; a compile pool queues only the predicted plain/minmax program and compiles the other at first use; depth/stencil state is built once at creation independently of that choice, so bind never waits; translated shader caches include codegen settings such as `force_robustness`, and compiled Metal objects use bounded LRU tables with ownership-checked publication) | faster: Stellar Blade Demo ~29 FPS against ~18 on MoltenVK on an M1 Max (split-screen video: `docs/media/stellar-blade-moltenvk-vs-kosmickrisp.mp4`); Steam UI, DXVK games and Stellar Blade Demo (D3D12, vkd3d-proton) run, its first run spends ~28 min compiling shaders on an M1 Max. macOS 26+ only; built only when the build host runs macOS 26+, otherwise MoltenVK is used. Known gaps (host repros): transform feedback with strip geometry shaders and its overflow counter (draft MR); within one render pass, depth writes to unmapped tiles stay in tile memory and later draws of the pass test against them (Tiled Resources Tier 2 allows this cache; vkd3d-proton's `test_sparse_depth_stencil_rendering` expects them dropped); no sparse 3D textures (Metal's 3D tiles are not Vulkan's standard 3D blocks), hence no Tiled Resources Tier 3 |
 | **MoltenVK** — Metal 3 · macOS 15+ (`moltenvk`) | `host/moltenvk/`: the UTM fork + steamac's patches | every supported Mac; the default on macOS 15 and in builds without KosmicKrisp (source builds on macOS 15; the release DMG includes KosmicKrisp since 1.7) |
 
 Switching changes the Venus driver identity (pipeline cache UUID), so Steam and games rebuild their
 shader caches. A pipeline the host driver cannot build is a placeholder in virglrenderer: its draws
 and dispatches are dropped, the driver never sees `VK_NULL_HANDLE`.
 
-**D3D11 on the Mac's Metal (wmtr), experimental.** Settings → Advanced → **D3D11 on the Mac's Metal
-(wmtr)** is off by default and applies on next start (`--wmtr-lib PATH` or `--no-wmtr` for one launch).
+**Allow DXMT (D3D11 on the Mac's Metal), experimental.** Settings → Advanced → **Allow DXMT (D3D11 on
+the Mac's Metal)** is off by default and applies on next start (`--wmtr-lib PATH` or `--no-wmtr` for one launch).
 The app bundles `libwmtr_host.dylib`; the guest layer carries DXMT's
 `{d3d11,dxgi,d3d10core,winemetal}.dll` and `winemetal.so`. With the toggle on, the launcher offers
 libkrun's wmtr virtio-gpu context (patch 0018, capset 30) and boots with `steamac.gfx=dxmt`.
@@ -672,24 +742,30 @@ installs and updates; turning the toggle off boots with `steamac.gfx=vulkan` and
 original files. DXMT's dlls are x86-64 with a Wine unixlib, which only an x86-64 Proton loads (in Proton
 11.0 (ARM64)'s ARM64EC Wine, winemetal's unix side does not come up and games report "could not load
 d3d11.dll"), while this Steam client maps every Windows title to Proton 11.0 (ARM64) (`proton-stable`,
-priority 85). So before Steam starts, `steam-compat-default` gives every installed Windows game (from
-`libraryfolders.vdf` and `appcache/appinfo.vdf`: type game/demo/application, oslist with windows but not
-linux) that has no tool of its own a per-game `CompatToolMapping` entry for **Proton 10.0** at priority 250,
-what Steam writes when a game is set to a tool in its Properties; Steam downloads Proton 10.0 (x86-64,
-run under FEX in Steam Linux Runtime 3.0) when such a game first starts, and `steam-gfx-path --watch` puts
-DXMT into it. Proton Experimental and the x86-64 Proton 11.0 need Steam Linux Runtime 4.0, which the arm64
-client refuses to install ("Invalid platform"). A game installed while Steam runs is switched at the next
-Steam start. The wildcard entry ("0") is never used: Steam applies a high-priority wildcard to its own
-tools as well and emptied the FEX tool that way. Off removes the entries the script added; one the user
-changes in Steam afterwards is left alone. D3D12 games on Proton 10.0 then run their Wine side under FEX
-instead of ARM64EC, which costs CPU time. Measured end to end on an M1 Max: Death's Door (Unity, D3D11)
+priority 85). Before Steam starts, `steam-compat-default` gives **only games whose profile selects DXMT**
+a per-game `CompatToolMapping` entry for **Proton 10.0** at priority 250, and only on a DXMT-enabled
+boot. Eligible titles are installed Windows games (`libraryfolders.vdf` and `appcache/appinfo.vdf`:
+type game/demo/application, oslist with windows but not linux) without a user-owned tool choice.
+Every other game keeps Steam's default tool, **Proton 11.0 ARM64**, with DXVK/vkd3d-proton on Venus.
+The old blanket mappings are removed on the first Steam start; subsequent profile changes or
+newly installed games are applied at the next Steam start. User edits in Steam remain untouched.
+This is not just a DLL choice: some games crash under x86-64 Proton 10.0 + FEX regardless of the
+DLLs used. Stellar Blade Demo (3564860), for example, ends SEH recursion with
+`virtual_setup_exception stack overflow` there, but runs on Proton 11.0 ARM64.
+Steam downloads Proton 10.0 (x86-64, under FEX in Steam Linux Runtime 3.0) on the first DXMT game
+launch, and `steam-gfx-path --watch` puts DXMT into it. Proton Experimental and x86-64 Proton 11.0
+need Steam Linux Runtime 4.0, which the arm64 client refuses to install ("Invalid platform").
+The wildcard entry ("0") is never used: Steam applies a high-priority wildcard to its own tools
+as well and emptied the FEX tool that way. Turning Allow DXMT off removes the script's mappings.
+D3D12 on Proton 10.0 runs Wine under FEX instead of ARM64EC, costing CPU time.
+Measured end to end on an M1 Max: Death's Door (Unity, D3D11)
 starts on Proton 10.0, reports the renderer as "Apple M1 Max" and draws through the executor's layer.
 Measured on that M1 Max (macOS 27, VM with 6 vCPUs / 8 GB at 120 Hz, KosmicKrisp): Death's Door's title
 screen ~41 FPS on the default Proton 11.0 (ARM64) + DXVK path, ~117 on DXMT (held by the 120 Hz display);
 d3d11bench with 100 draws and 16 full-screen passes 44 / 50 (Proton 10.0 + DXVK) / 100 FPS, with 2000
 draws and 4 passes 133 / 139 / 115 (DXMT stops at the display's 120 Hz, the Vulkan path goes past it).
 Medians of three 20 s runs launched through Steam (DXMT: six over two boots); details on the site.
-This is a global selection, not a per-game setting. DXMT's winemetal calls cross virtio-gpu to an
+DXMT's winemetal calls cross virtio-gpu to an
 executor **inside the VM process on the Mac**, which presents a `CAMetalLayer` in the VM view.
 That layer would cover the guest compositor's cursor; the launcher draws the game's own cursor above
 it instead (see “Cursor on the DXMT path” under “How it works”).
@@ -920,7 +996,8 @@ to everyone at <https://fxgl.github.io/steamac/games.html> (`docs/games.html`).
 The guest agent watches Steam's game scopes (`app-steam-app<appid>-*.scope`, the same cgroups
 **Pause the game** freezes) on its 1 s heartbeat and reports `game-start <appid>`, `game-mem <appid>
 <anon_kib> <guest_used_kib>` every 5 s (the game's anonymous memory and the guest's used memory),
-`game-proton <appid> <version>` (the prefix's `compatdata/<appid>/version`) and `game-exit <appid>`;
+`game-proton <appid> <version>` (the prefix's `compatdata/<appid>/version`), immediately followed by
+`game-gfx <appid> dxmt|vulkan` (the actual graphics path), and `game-exit <appid>`;
 `game <appid> <name>` follows the first `game-start` or focus of an app id per boot. The launcher
 (`GameStats.swift`) makes one report per game run: how long it ran and had focus (not paused, VM
 not suspended), whether a window ever appeared and after how long (a run without one is a failed
@@ -931,6 +1008,11 @@ process's peak `phys_footprint` on the Mac, resolution, Proton version, and the 
 `shutdown`, `session`). Each report carries the Mac (model, chip, P and total cores, GPU cores,
 RAM, macOS), the VM (vCPUs, RAM, Vulkan driver, wmtr, refresh rate, SteamOS build) and the
 launcher version.
+New session and rating reports use schema `v:2`, with optional `gfx` (`vulkan` or `dxmt`) and `env`
+(the allowlisted launch words described in “Per-game profiles”, at most 256 characters). The actual
+graphics path comes from `game-gfx`; ratings use the last session's graphics path and launch words.
+The service still accepts v1 (including previously saved sessions), storing its `gfx`/`env` as NULL.
+Invalid v2 assignments are rejected with HTTP 400; valid ones are sorted by name, last duplicate wins.
 
 Every report is kept on this Mac (`~/Library/Application Support/es.fxgam.steamac/game-stats.json`,
 20 sessions per game) and listed in **Settings → Games**. Nothing leaves the Mac until **Share
@@ -942,16 +1024,28 @@ recorded earlier included; a game whose **Share** box is off sends nothing and i
 withdrawn (`"rating": "none"`). Uploads go one at a time; HTTP 400/413 drops a report, anything
 else is retried after 10 minutes, at the next session end or the next boot.
 
-Privacy: no name, user or computer name, Steam account, files or typed text; the install ID is a
+Privacy: no name, user or computer name, Steam account, files or arbitrary typed text (only the
+allowlisted graphics launch words above are shared); the install ID is a
 random UUID used only for distinct-Mac counts and rate limits (not the crash reports' ID); the
 service uses the client address only as a transient rate-limit key and never stores it.
 
-The page publishes aggregates only (per game and per chip / RAM / driver / wmtr), never single
-sessions, and lists the chips each game was tested on. Its **My Mac** filter keeps only reports
-from Macs that are not better than the visitor's (GPU cores, RAM and performance cores each at most
-the given value; the API's `max_gpu_cores`, `max_ram_gb`, `max_pcores`): what runs there should
-run here. **Open Statistics Page** in the launcher passes this Mac's values (`?chip=…&gpu=…&ram=…&pcores=…`)
-and turns the filter on; the page remembers them.
+The page publishes aggregates only, never single sessions, and lists the chips each game was tested
+on. Configurations group by chip, RAM, Vulkan driver, graphics path and launch words (`gfx`/`env`;
+`wmtr` is retained for compatibility). For old rows, NULL `gfx` means `vulkan` when `wmtr=0`,
+but unknown when `wmtr=1`: permission to use DXMT does not prove a game used it.
+Its **My Mac** filter keeps only reports from Macs that are not better than the visitor's (GPU cores,
+RAM and performance cores each at most the given value; the API's `max_gpu_cores`, `max_ram_gb`,
+`max_pcores`): what runs there should run here. **Open Statistics Page** in the launcher passes this
+Mac's values (`?chip=…&gpu=…&ram=…&pcores=…`) and turns the filter on; the page remembers them.
+
+`GET /v1/games/<appid>` also returns `recommended` (or `null` if no profile qualifies).
+It groups `(driver, gfx, env)` across all chips within the same My Mac filters, requiring at least
+two distinct installations across sessions or ratings; unknown graphics paths cannot win.
+Score = `(well + 0.5 × issues) / total ratings` (zero without ratings); ties favor higher
+`launch_rate`, then lower `early_exit_rate`, with missing rates last and deterministic
+driver/graphics/env ordering after that. The result includes driver, graphics path, launch words,
+install/session counts, ratings, median average FPS and launch rate. The site and launcher show
+the recommendation, but it is never applied automatically.
 
 Service: `services/game-stats` — a Cloudflare Worker with a D1 database (strict validation,
 idempotent session IDs, 30 POSTs per minute per address, a daily cap per install, 5-minute cached
@@ -964,6 +1058,9 @@ npx wrangler d1 create steamac-game-stats      # put the printed database_id int
 npx wrangler d1 migrations apply steamac-game-stats --remote
 npx wrangler deploy                            # prints https://steamac-game-stats.<account>.workers.dev
 ```
+For an existing deployment, migration `0002_profiles.sql` adds `gfx`/`env` to sessions and ratings
+and updates the grouping indexes while preserving v1 data. Run
+`npx wrangler d1 migrations apply steamac-game-stats --remote` **before** `npx wrangler deploy`.
 
 The Worker URL goes into `host/launcher/Info.plist` (`SteamacGameStatsURL`) and `docs/assets/games.js`
 (`API`). Local: `npx wrangler d1 migrations apply steamac-game-stats --local && npx wrangler dev`,

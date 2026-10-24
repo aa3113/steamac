@@ -22,6 +22,9 @@ do {
     MainActor.assumeIsolated { AppBundle.alertIfLaunchedFromFinder("FX Steam Launcher cannot start", error.localizedDescription) }
     exit(2)
 }
+if Supervisor.isChild, let driver = Supervisor.profileDriver { options.vulkanDriver = driver }
+settings.bootedDriver = Supervisor.isChild ? options.vulkanDriver : nil
+settings.bootedDXMT = Supervisor.isChild ? options.wmtrLibrary != nil : nil
 
 if options.selftestMetalCache { MetalCompilerCache.selfTest() }
 // Before CrashReporting's GPU tags, the window or either Vulkan driver can initialise Metal.
@@ -101,6 +104,7 @@ final class Lifecycle: NSObject, NSApplicationDelegate {
     var settingsContext: SettingsContext?
     var suspender: SuspendController?
     /// Opens Report a Problem over the VM window.
+    var gameProfiles: GameProfileController?
     var report: (() -> Void)?
     private var requestedAt: Date?
     /// SteamOS can take ~2 min to stop (systemd stop-job timeouts) before libkrun exits.
@@ -245,7 +249,11 @@ final class Lifecycle: NSObject, NSApplicationDelegate {
 
 extension Lifecycle: NSMenuItemValidation {
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        if item.action == #selector(menuMetalHUD) { item.state = LauncherSettings.shared.metalHUD ? .on : .off }
+        if item.action == #selector(menuMetalHUD) {
+            item.state = LauncherSettings.shared.metalHUD ? .on : .off
+            // libMTLHud's own item (MainMenu.adoptHUDMenuItems): titled and ticked like the View menu item.
+            if item.tag == MainMenu.adoptedHUDItemTag { item.title = String(localized: "Show Metal Performance HUD (Ctrl+Cmd+P)") }
+        }
         if item.action == #selector(menuCheckForUpdates) {
             item.title = UpdateChecker.shared.menuTitle
             item.badge = UpdateChecker.shared.available != nil ? NSMenuItemBadge(string: String(localized: "New", comment: "Badge on a menu item when an update is available")) : nil
@@ -303,6 +311,8 @@ do {
     progress.onGameName = { id, name in settings.setGameName(name, for: id) }
     // `appid` tag of crash/error reports (the window and GamePause chain their handlers after this).
     progress.onFocus = { CrashReporting.focusedGame($0) }
+    lifecycle.gameProfiles = GameProfileController(settings: settings, progress: progress, port: progressPort,
+        options: options, window: { lifecycle.window?.window }, restart: { lifecycle.requestRestart() })
     progress.onProvision = { ok, reason in Provision.finished(ok: ok, reason: reason, payload: options.provisionPayload) }
     if let p = options.provisionPayload { log("provision: first boot of this disk: payload \(p) attached read-only, \(Provision.cmdlineFlag)") }
     progress.onConfig = { ok, reason in Provision.configFinished(ok: ok, reason: reason, payload: options.configPayload) }

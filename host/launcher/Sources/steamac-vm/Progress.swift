@@ -34,11 +34,12 @@ enum GuestGameEvent: Equatable {
     /// Anonymous memory of the game's scopes and the guest's used memory (MemTotal - MemAvailable).
     case memory(appid: Int, anonKiB: Int, guestUsedKiB: Int)
     case proton(appid: Int, version: String)
+    case gfx(appid: Int, gfx: String)
     case exit(appid: Int)
 
     var appid: Int {
         switch self {
-        case .start(let id), .exit(let id), .memory(let id, _, _), .proton(let id, _): return id
+        case .start(let id), .exit(let id), .memory(let id, _, _), .proton(let id, _), .gfx(let id, _): return id
         }
     }
 }
@@ -112,6 +113,7 @@ final class BootProgress {
     var onCursorImage: ((_ width: Int, _ height: Int, _ xhot: Int, _ yhot: Int, _ bgra: Data) -> Void)?
     /// `cursor-pos <x> <y> <root_w> <root_h>`: cursor position in the game's Xwayland root pixels.
     var onCursorPosition: ((_ x: Int, _ y: Int, _ rootWidth: Int, _ rootHeight: Int) -> Void)?
+    var onProfilesOK: ((_ hash: String, _ pending: Bool) -> Void)?
 
     private var sawConsole = false
     private var okLines = 0
@@ -250,6 +252,14 @@ final class BootProgress {
             guard f.count >= 5, let x = Int(f[1]), let y = Int(f[2]),
                   let rw = Int(f[3]), let rh = Int(f[4]), rw > 0, rh > 0 else { return }
             onCursorPosition?(x, y, rw, rh)
+        case "profiles-ok":
+            guard parts.count == 3, parts[1].count == 64,
+                  parts[1].allSatisfy({ $0.isHexDigit }), ["applied", "pending"].contains(parts[2]) else { return }
+            onProfilesOK?(parts[1], parts[2] == "pending")
+        case "game-gfx":
+            guard parts.count == 3, let id = Int(parts[1]), id > 0,
+                  ["dxmt", "vulkan"].contains(parts[2]) else { return }
+            onGameEvent?(.gfx(appid: id, gfx: parts[2]))
         case "game-start", "game-exit", "game-mem", "game-proton":
             guard parts.count >= 2, let id = Int(parts[1]), id > 0 else { return }
             switch verb {
@@ -488,6 +498,7 @@ final class ProgressPort {
     let guestInputFd: Int32
     private let readFd: Int32
     private let inputWriteFd: Int32
+    private let sendQueue = DispatchQueue(label: "steamac.progress.send")
 
     init() throws {
         var out: [Int32] = [0, 0], inp: [Int32] = [0, 0]
@@ -495,16 +506,23 @@ final class ProgressPort {
         readFd = out[0]; guestOutputFd = out[1]
         guestInputFd = inp[0]; inputWriteFd = inp[1]
         for fd in out + inp { _ = fcntl(fd, F_SETFD, FD_CLOEXEC) }
-        // Requests are tiny; never block the main thread if libkrun stops draining the pipe.
-        _ = fcntl(inputWriteFd, F_SETFL, fcntl(inputWriteFd, F_GETFL) | O_NONBLOCK)
     }
 
-    /// One host -> guest line; false if the pipe did not take it whole.
-    func send(_ line: String) -> Bool {
-        let bytes = Array((line + "\n").utf8)
-        var n: Int
-        repeat { n = Darwin.write(inputWriteFd, bytes, bytes.count) } while n < 0 && errno == EINTR
-        return n == bytes.count
+    /// Queue one complete line. Profiles can exceed PIPE_BUF: serialize full writes off the UI thread.
+    @discardableResult func send(_ line: String) -> Bool {
+        let bytes = Data((line + "\n").utf8)
+        sendQueue.async { [inputWriteFd] in
+            bytes.withUnsafeBytes { buffer in
+                var offset = 0
+                while offset < buffer.count {
+                    let n = Darwin.write(inputWriteFd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0 else { log("progress: host request write failed"); return }
+                    offset += n
+                }
+            }
+        }
+        return true
     }
 
     /// Reader thread: every complete line goes to `handler` on the main queue.
