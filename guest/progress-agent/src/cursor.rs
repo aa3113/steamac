@@ -6,12 +6,12 @@
 //! blank (1x1, transparent) as soon as DayZ leaves inventory.
 //!
 //! The host draws the cursor itself, so the guest sends the XFixes cursor bitmap (BGRA, the
-//! native little-endian bytes of the X cursor image) and its root-window position. The guest
-//! scanout cannot be used for this: while a game is remoted it may show a white Steam / loading
-//! surface, which a black-keyed overlay would cover the game with.
+//! native little-endian bytes of the X cursor image) and its position in the focused game's X
+//! window. The guest scanout cannot be used for this: while a game is remoted it may show a
+//! white Steam / loading surface, which a black-keyed overlay would cover the game with.
 //!
 //! Messages (on change): `cursor 0|1`, `cursor-image <w> <h> <xhot> <yhot> <base64 BGRA>`,
-//! `cursor-pos <x> <y> <root_w> <root_h>`.
+//! `cursor-pos <x> <y> <win_w> <win_h>`.
 
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
@@ -48,8 +48,16 @@ struct Image {
 struct Pos {
     x: i16,
     y: i16,
-    root_width: u16,
-    root_height: u16,
+    width: u16,
+    height: u16,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+struct Target {
+    conn: usize,
+    window: Window,
+    width: u16,
+    height: u16,
 }
 
 pub struct Cursor {
@@ -58,7 +66,7 @@ pub struct Cursor {
     next_poll: Instant,
     next_image: Instant,
     next_select: Instant,
-    selected: Option<usize>,
+    target: Option<Target>,
     last_visible: Option<bool>,
     last_image: Option<Image>,
     last_pos: Option<Pos>,
@@ -72,7 +80,7 @@ impl Cursor {
             next_poll: Instant::now(),
             next_image: Instant::now(),
             next_select: Instant::now(),
-            selected: None,
+            target: None,
             last_visible: None,
             last_image: None,
             last_pos: None,
@@ -87,8 +95,10 @@ impl Cursor {
 
     fn drop_conn(&mut self, i: usize) {
         self.conns.remove(i);
-        self.selected = None;
+        self.target = None;
+        self.last_pos = None;
         self.next_scan = Instant::now();
+        self.next_select = Instant::now();
     }
 
     fn connect(&mut self) {
@@ -120,36 +130,71 @@ impl Cursor {
                 width,
                 height,
             });
-            self.selected = None;
+            self.target = None;
         }
     }
 
-    /// The Xwayland showing the game (its active window's WM_CLASS starts with steam_app_).
-    fn select_index(&self) -> Option<usize> {
+    /// The active window of an Xwayland display.
+    fn active_window(c: &Conn) -> Option<Window> {
+        c.conn
+            .get_property(false, c.root, c.active_atom, AtomEnum::WINDOW, 0, 1)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut v| v.next()))
+            .filter(|&w| w != 0)
+    }
+
+    /// The active window if it belongs to a game (WM_CLASS starts with `steam_app_`).
+    fn active_game_window(c: &Conn) -> Option<Window> {
+        let win = Self::active_window(c)?;
+        let class: Vec<u8> = c
+            .conn
+            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|r| r.value)
+            .unwrap_or_default();
+        if class.windows(10).any(|w| w == b"steam_app_") {
+            Some(win)
+        } else {
+            None
+        }
+    }
+
+    fn target_for(&self, i: usize, window: Window) -> Target {
+        let c = &self.conns[i];
+        let (width, height) = if window == c.root {
+            (c.width, c.height)
+        } else {
+            c.conn
+                .get_geometry(window)
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .map(|g| (g.width, g.height))
+                .filter(|&(w, h)| w > 0 && h > 0)
+                .unwrap_or((c.width, c.height))
+        };
+        Target { conn: i, window, width, height }
+    }
+
+    /// The game window to map cursor positions into. Its client pixels are what the remoted
+    /// game layer presents; the X root can be larger when a title runs windowed.
+    fn select_target(&self) -> Option<Target> {
+        if let Some((i, window)) = self
+            .conns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.xfixes)
+            .find_map(|(i, c)| Self::active_game_window(c).map(|w| (i, w)))
+        {
+            return Some(self.target_for(i, window));
+        }
         if self.conns.len() == 1 {
-            return self.conns[0].xfixes.then_some(0);
+            let c = &self.conns[0];
+            return c.xfixes.then(|| self.target_for(0, c.root));
         }
-        if let Some(i) = self.conns.iter().position(|c| {
-            let win = c
-                .conn
-                .get_property(false, c.root, c.active_atom, AtomEnum::WINDOW, 0, 1)
-                .ok()
-                .and_then(|cookie| cookie.reply().ok())
-                .and_then(|r| r.value32().and_then(|mut v| v.next()))
-                .filter(|&w| w != 0);
-            let Some(win) = win else { return false };
-            let class: Vec<u8> = c
-                .conn
-                .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)
-                .ok()
-                .and_then(|cookie| cookie.reply().ok())
-                .map(|r| r.value)
-                .unwrap_or_default();
-            class.windows(10).any(|w| w == b"steam_app_")
-        }) {
-            return Some(i);
-        }
-        self.conns.iter().position(|c| c.xfixes)
+        let i = self.conns.iter().position(|c| c.xfixes)?;
+        Some(self.target_for(i, self.conns[i].root))
     }
 
     pub fn pump(&mut self, port: &mut Port) {
@@ -164,31 +209,39 @@ impl Cursor {
         self.next_poll = now + Duration::from_millis(16);   // follow the cursor at ~60 Hz
         if now >= self.next_select {
             self.next_select = now + Duration::from_millis(250);
-            self.selected = self.select_index();
+            let target = self.select_target();
+            if target != self.target {
+                self.last_pos = None;
+            }
+            self.target = target;
         }
-        let Some(i) = self.selected.filter(|&i| i < self.conns.len()) else { return };
-        let c = &self.conns[i];
-        if !c.xfixes {
-            return;
-        }
+        let Some(target) = self.target.filter(|t| t.conn < self.conns.len()) else { return };
 
-        // Position is a cheap round-trip, needed every poll for smooth movement.
-        let Some(reply) = c.conn.query_pointer(c.root).ok().and_then(|cookie| cookie.reply().ok()) else {
-            self.drop_conn(i);
+        // Position is a cheap round-trip, needed every poll for smooth movement. Query the
+        // game window, not the root: `win_x`/`win_y` are client pixels whatever the title's
+        // window size and position are.
+        let reply = {
+            let c = &self.conns[target.conn];
+            if !c.xfixes {
+                return;
+            }
+            c.conn.query_pointer(target.window).ok().and_then(|cookie| cookie.reply().ok())
+        };
+        let Some(reply) = reply else {
+            self.drop_conn(target.conn);
             return;
         };
-        let pos = Pos { x: reply.root_x, y: reply.root_y, root_width: c.width, root_height: c.height };
+        let pos = Pos { x: reply.win_x, y: reply.win_y, width: target.width, height: target.height };
 
         // The bitmap changes rarely; fetching it 20 times a second is enough for visibility and shape.
         if now >= self.next_image {
             self.next_image = now + Duration::from_millis(50);
-            let Some(img) = c
-                .conn
-                .xfixes_get_cursor_image()
-                .ok()
-                .and_then(|cookie| cookie.reply().ok())
-            else {
-                self.drop_conn(i);
+            let reply = {
+                let c = &self.conns[target.conn];
+                c.conn.xfixes_get_cursor_image().ok().and_then(|cookie| cookie.reply().ok())
+            };
+            let Some(img) = reply else {
+                self.drop_conn(target.conn);
                 return;
             };
             let fits = img.width <= MAX_CURSOR_DIMENSION && img.height <= MAX_CURSOR_DIMENSION;
@@ -232,7 +285,7 @@ impl Cursor {
             self.last_pos = Some(pos);
             port.send_quiet(&format!(
                 "cursor-pos {} {} {} {}",
-                pos.x, pos.y, pos.root_width, pos.root_height
+                pos.x, pos.y, pos.width, pos.height
             ));
         }
     }

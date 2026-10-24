@@ -37,7 +37,7 @@
 //!                                 app ids 0 and 769 are excluded from per-game statistics
 //!   cursor 0|1                    the focused game's cursor visible (cursor.rs; DXMT path overlay)
 //!   cursor-image <w> <h> <xhot> <yhot> <base64>   the X cursor bitmap (BGRA), on change
-//!   cursor-pos <x> <y> <root_w> <root_h>          its position in the game's Xwayland root
+//!   cursor-pos <x> <y> <win_w> <win_h>           its position in the focused game's X window
 //!
 //! Host -> guest (same port): `collect-logs <id>`, served at any point of the
 //! lifecycle below (worker thread; the bundle goes out from the main loop);

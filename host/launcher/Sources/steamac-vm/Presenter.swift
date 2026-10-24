@@ -87,10 +87,10 @@ final class VMView: NSView {
         let yhot: Int
     }
     /// The focused game's cursor, forwarded by the progress agent (`cursor`, `cursor-image`,
-    /// `cursor-pos`). Position and root size are in the game's Xwayland pixels.
+    /// `cursor-pos`). Position and size are in the focused game's X window pixels.
     private var guestCursorVisible = false
     private var guestCursorPosition: (x: Int, y: Int)?
-    private var guestCursorRoot: (width: Int, height: Int)?
+    private var guestCursorWindow: (width: Int, height: Int)?
     private var guestCursorGlyph: CursorGlyph?
     /// X cursor bitmaps are small; cap guest input before multiplying dimensions.
     private static let maxCursorDimension = 256
@@ -117,9 +117,9 @@ final class VMView: NSView {
         updateCursorLayer()
     }
 
-    func guestCursorPosition(x: Int, y: Int, rootWidth: Int, rootHeight: Int) {
+    func guestCursorPosition(x: Int, y: Int, windowWidth: Int, windowHeight: Int) {
         guestCursorPosition = (x, y)
-        guestCursorRoot = (rootWidth, rootHeight)
+        guestCursorWindow = (windowWidth, windowHeight)
         updateCursorLayer()
     }
     /// Fallback geometry for pointer mapping before the first frame.
@@ -214,42 +214,53 @@ final class VMView: NSView {
         }
     }
 
-    /// A remoted game layer is present (DXMT): it would cover the guest's cursor.
-    private var hasGameLayer: Bool {
-        (metalLayer.sublayers ?? []).contains { $0 is CAMetalLayer && $0.name != Self.cursorLayerName }
+    /// The topmost remoted game layer (DXMT): it would cover the guest's cursor.
+    private var activeGameLayer: CAMetalLayer? {
+        (metalLayer.sublayers ?? [])
+            .compactMap { $0 as? CAMetalLayer }
+            .last { $0.name != Self.cursorLayerName && !$0.isHidden }
     }
 
     /// The cursor layer is a child of `metalLayer`; a plain CALayer survives wmtr removing its
     /// CAMetalLayer children, but re-attach it anyway if that ever changes.
+    ///
+    /// The guest reports the cursor in the focused game's X window pixels. Map it into the game
+    /// layer's drawable, not the guest scanout: the two can differ (the remoted swapchain is
+    /// aspect-fit into the view) and the cursor must follow the picture the game actually shows.
     private func updateCursorLayer() {
-        guard let position = guestCursorPosition, let root = guestCursorRoot, root.width > 0, root.height > 0,
-              let glyph = guestCursorGlyph, let content = renderer.texture else {
+        guard gameLayersVisible, guestCursorVisible,
+              let position = guestCursorPosition,
+              let window = guestCursorWindow, window.width > 0, window.height > 0,
+              let glyph = guestCursorGlyph,
+              let game = activeGameLayer,
+              game.drawableSize.width > 0, game.drawableSize.height > 0 else {
             cursorLayer.isHidden = true
             return
         }
-        let show = gameLayersVisible && hasGameLayer && guestCursorVisible
-        if show, cursorLayer.superlayer !== metalLayer {
+        if cursorLayer.superlayer !== metalLayer {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             metalLayer.addSublayer(cursorLayer)
             CATransaction.commit()
         }
-        let fit = Renderer.fit(content: CGSize(width: content.width, height: content.height), in: metalLayer.bounds)
-        let sx = fit.width / CGFloat(root.width), sy = fit.height / CGFloat(root.height)
+        // wmtr gives the game layer contentsGravity = .resizeAspect, so this is the rect where
+        // its drawable is actually shown. Use the layer's convert() so a future non-full-view
+        // game layer keeps working.
+        let fit = Renderer.fit(content: game.drawableSize, in: game.bounds)
+        let shown = game.convert(fit, to: metalLayer)
+        let sx = shown.width / CGFloat(window.width), sy = shown.height / CGFloat(window.height)
         let w = CGFloat(glyph.image.width) * sx, h = CGFloat(glyph.image.height) * sy
-        let left = fit.minX + (CGFloat(position.x) - CGFloat(glyph.xhot)) * sx
-        let top = fit.minY + (CGFloat(position.y) - CGFloat(glyph.yhot)) * sy
-        // X root Y grows downward; a CALayer child uses the parent's (bottom-left) Y unless flipped.
+        let left = shown.minX + (CGFloat(position.x) - CGFloat(glyph.xhot)) * sx
+        let top = shown.minY + (CGFloat(position.y) - CGFloat(glyph.yhot)) * sy
+        // X window Y grows downward; a CALayer child uses the parent's (bottom-left) Y unless flipped.
         let y = metalLayer.isGeometryFlipped ? top : metalLayer.bounds.maxY - top - h
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        cursorLayer.isHidden = !show
-        if show {
-            cursorLayer.zPosition = 1000
-            cursorLayer.frame = CGRect(x: left.rounded(), y: y.rounded(),
-                                       width: w.rounded(), height: h.rounded())
-            cursorLayer.contents = glyph.image
-        }
+        cursorLayer.zPosition = 1000
+        cursorLayer.frame = CGRect(x: left.rounded(), y: y.rounded(),
+                                   width: w.rounded(), height: h.rounded())
+        cursorLayer.contents = glyph.image
+        cursorLayer.isHidden = false
         CATransaction.commit()
     }
 

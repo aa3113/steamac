@@ -1,125 +1,73 @@
-# Cursor overlay implementation review
+# Cursor overlay
 
-## Overall
+The DXMT path presents the game in a host `CAMetalLayer` above the guest scanout, so the guest
+compositor's cursor is covered. The overlay is a separate transparent `CALayer` above the remoted
+game layers; it carries the game's real XFixes cursor bitmap, hotspot, position and visibility.
 
-The implementation is sound and fixes the problem at the right layer. The important architectural choices are right:
+## Data path
 
-- It sends the **actual X cursor bitmap, hotspot, and position**, not the guest scanout.
-- It keeps the cursor on a **separate transparent layer above wmtr's game layers**.
-- It excludes that layer from game-layer hiding and HUD policies.
-- It detects visibility from the game's real X cursor state, which is what Wine changes when DayZ enters or leaves inventory.
-- It keeps the Vulkan path untouched by requiring an actual remoted game layer.
+The guest agent (`guest/progress-agent/src/cursor.rs`) finds the Xwayland display whose active
+window's `WM_CLASS` starts with `steam_app_`, follows the pointer with `QueryPointer` every 16 ms,
+and fetches `XFixesGetCursorImage` every 50 ms. It sends only changes:
 
-It is more complex than it needs to be, though, and there are a few robustness issues worth knowing about.
-
-## Main critique
-
-### 1. A Metal layer is unnecessary for a static cursor image
-
-The cursor overlay is just an image. It does not need:
-
-- a `CAMetalLayer`,
-- a render pipeline,
-- command buffers,
-- `nextDrawable()`,
-- per-update Metal draws,
-- premultiplied blend state written by hand.
-
-A plain `CALayer` with `contents = CGImage` would do the same job: the compositor would scale and alpha-blend the cursor automatically. The image only changes when the cursor shape changes, and the layer only moves when the position changes.
-
-That would remove most of `Renderer.setCursorImage` and `drawCursorOverlay`, and avoid the risk of `nextDrawable()` blocking the main thread when updates arrive faster than the display can present. The only care needed is the layer coordinate system: Core Animation on macOS is generally bottom-left-origin, unlike the Metal viewport path currently used.
-
-This is the biggest simplification available.
-
-### 2. The guest polls too much
-
-Every 16 ms, `cursor.rs`:
-
-- re-checks `_NET_ACTIVE_WINDOW`,
-- reads `WM_CLASS` for each Xwayland display,
-- calls `XFixesGetCursorImage`, which transfers the full cursor bitmap each time,
-- then compares it to the previous image.
-
-The bitmap is only sent on change, but it is **fetched** every frame. That is wasteful for an image that usually changes rarely.
-
-A better split would be:
-
-- use XFixes cursor-change notifications for `cursor-image`,
-- use XInput2 motion events or `XQueryPointer` for position,
-- fetch the full cursor image only when the cursor actually changes.
-
-At minimum, the selected Xwayland display could be cached instead of re-querying the active window and `WM_CLASS` at 60 Hz.
-
-### 3. The overlay is redrawn more often than necessary
-
-`redraw()` calls `updateCursorLayer()` on every guest frame. That can create and present a cursor drawable even when the cursor has not moved and its image has not changed.
-
-A dirty flag — redraw only when visibility, position, image, or layer attachment changes — would avoid a steady stream of unnecessary command buffers. This becomes less important if the overlay is changed to a plain `CALayer`.
-
-### 4. Display discovery is not re-run after the first connection
-
-`Cursor::connect()` only runs while `self.conns.is_empty()`. If:
-
-- the game's Xwayland display appears after the agent first connects,
-- an existing display dies,
-- or the wrong XFixes display was selected initially,
-
-the agent may never discover or recover the correct display. Failed `XFixesGetCursorImage` calls simply return; the stale connection is kept.
-
-Periodic rescanning, or dropping failed connections and retrying, would make this more reliable.
-
-The fallback in `select_index()` — "any XFixes-capable display" — can also select Steam's display before the game's active window is visible. Requiring `steam_app_` would be less surprising, though it may delay the first cursor update slightly.
-
-### 5. Coordinate mapping assumes root == displayed game area
-
-The host maps the X root position into the guest picture's fitted rectangle. That is correct when:
-
-- the game is fullscreen,
-- the X root matches the guest scanout,
-- and wmtr's game layer fills the same rectangle.
-
-It can drift if the game runs in a window, the game layer has a different viewport, or the remoted layer's scaling differs from the guest picture. More robust input would be the focused game window's geometry, or a normalized cursor position relative to the game layer.
-
-### 6. Untrusted guest input needs tighter validation
-
-The wmtr path already has a strong security caveat, but the cursor parser should still be hardened.
-
-`Progress.swift` validates:
-
-```swift
-data.count == w * h * 4
+```text
+cursor 0|1
+cursor-image <w> <h> <xhot> <yhot> <base64 BGRA>
+cursor-pos <x> <y> <win_w> <win_h>
 ```
 
-where `w` and `h` come from guest text. A malformed line with very large values can overflow that multiplication and trap the host. `setCursorImage` performs the same multiplication.
+`cursor-pos` is in the focused game's X **window client** pixels, from `QueryPointer` on that
+window, not the X root. The client size is refreshed with `GetGeometry` when the target is
+resolved. A 1×1 or fully transparent cursor is hidden, as Wine uses for a game without a cursor.
 
-There should be a conservative maximum, such as 512×512 or 1024×1024, checked before any multiplication or allocation. The hotspot should also be clamped or validated.
+The launcher parses the messages in `Progress.swift` and forwards them through `Window.swift` to
+`VMView` in `Presenter.swift`, which owns the transparent `CALayer` named
+`steamac.cursor-overlay` at `zPosition` 1000. The cursor layer is excluded from the game-layer and
+Metal HUD policies and is hidden unless a game layer is visible and the guest cursor is visible.
 
-### 7. The text/base64 protocol is a little fragile for images
+## Coordinate mapping
 
-The cursor bitmap is sent as one long base64 line, which required raising the port buffer and line-splitter limits to 256 KB. That works for ordinary cursors, but:
+The cursor must follow the remoted game layer, not the guest scanout. The game layer's drawable is
+aspect-fit into the layer (`contentsGravity = .resizeAspect`), so the overlay computes:
 
-- a maximum-size cursor can exceed the limit,
-- a malformed or oversized line is silently dropped,
-- base64 adds 33% overhead for every cursor change.
+```swift
+let fit = Renderer.fit(content: game.drawableSize, in: game.bounds)
+let shown = game.convert(fit, to: metalLayer)
+let sx = shown.width / CGFloat(window.width)
+let sy = shown.height / CGFloat(window.height)
+```
 
-For occasional cursor changes this is fine. If animated cursors become common, chunked binary messages or a shared-memory path would be cleaner.
+It then places the cursor image at `(x - xhot, y - yhot)` in that rect, scaled by the same factors.
+Using `game.drawableSize` rather than the guest scanout fixes drift when the remoted swapchain's
+size or aspect differs from the guest picture. Using window-relative coordinates fixes drift when a
+game runs windowed. `CALayer.convert` keeps the mapping correct if wmtr ever places a game layer
+somewhere other than the full VM view.
 
-## Better or different designs
+## Validation
 
-In rough order of effort:
+Both ends cap cursor dimensions at 256×256 and check multiplication overflow before allocating or
+creating the image. The hotspot is clamped to the image. The guest's cursor line buffer and the
+host parser allow a maximum-size bitmap (about 350 KB of base64) within their 512 KB pending-line
+limits.
 
-1. **Replace the cursor `CAMetalLayer` with a plain `CALayer` carrying a `CGImage`.**  
-   Simplest and probably best. Less code, no GPU draw per update, compositor handles scaling and blending.
+## Remaining limitations
 
-2. **Make the guest event-driven.**  
-   Use XFixes cursor notifications for image changes and XInput2/query-pointer for motion. Fetch the image only when it changes, and cache the active display.
+- The position is still polled at 16 ms rather than driven by XInput2/XFixes events. The active
+  window/geometry are re-resolved every 250 ms, and displays are rescanned every 5 s.
+- With several visible game layers, the overlay uses the topmost one. There is no explicit binding
+  between the focused X window and a particular wmtr `CAMetalLayer`; a title with multiple
+  swapchains could need wmtr to mark the active layer.
+- `sx` and `sy` are separate. This is exact when the swapchain matches the X client area (the
+  normal case); a swapchain with a different aspect than the window would stretch the cursor.
+- The bitmap is base64 in one text line. Animated cursors would benefit from XFixes change
+  notifications and a binary/chunked path.
+- The cursor is not part of the game drawable, so it is not in game screenshots or captures. This
+  is a consequence of keeping cursor updates independent of the game's present rate.
 
-3. **Composite the cursor inside wmtr/DXMT instead of as a separate host overlay.**  
-   Architecturally the cleanest, because the cursor would be part of the remoted game layer and could never be misordered or misaligned. But it requires changes to wmtr or DXMT and a cursor metadata path, so it is much more invasive.
+## Alternative not taken
 
-4. **Track cursor position on the host from input events.**  
-   Tempting because the host already sends mouse movement, but it is not reliable: games warp, clamp, and hide the cursor, and relative input does not always correspond one-to-one with the displayed game cursor. The guest's X cursor position is the better source.
-
-## Verdict
-
-The solution is pragmatic and correct in principle. I would keep the protocol and the separate-overlay architecture, but simplify the overlay to a plain `CALayer`, reduce the polling cost, harden the size validation, and make the Xwayland connection lifecycle self-healing. Those changes would preserve the behaviour while making the implementation smaller and more robust.
+Drawing the cursor into DXMT's game drawable before present would remove the coordinate mapping
+entirely and make the cursor part of the game image. It would also tie cursor motion to the game's
+present rate (a paused or static game would freeze the cursor), require format/colour-space-aware
+blending in the wmtr/DXMT presentation path, and need a way to identify the correct swapchain.
+The separate layer keeps cursor updates independent and leaves the vendored DXMT path untouched.

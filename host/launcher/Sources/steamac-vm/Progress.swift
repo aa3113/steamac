@@ -111,8 +111,9 @@ final class BootProgress {
     var onCursorVisible: ((_ visible: Bool) -> Void)?
     /// `cursor-image <w> <h> <xhot> <yhot> <base64 BGRA>`: the X cursor bitmap, on change.
     var onCursorImage: ((_ width: Int, _ height: Int, _ xhot: Int, _ yhot: Int, _ bgra: Data) -> Void)?
-    /// `cursor-pos <x> <y> <root_w> <root_h>`: cursor position in the game's Xwayland root pixels.
-    var onCursorPosition: ((_ x: Int, _ y: Int, _ rootWidth: Int, _ rootHeight: Int) -> Void)?
+    /// `cursor-pos <x> <y> <win_w> <win_h>`: cursor position and size in the focused game's X
+    /// window pixels.
+    var onCursorPosition: ((_ x: Int, _ y: Int, _ windowWidth: Int, _ windowHeight: Int) -> Void)?
     var onProfilesOK: ((_ hash: String, _ pending: Bool) -> Void)?
 
     private var sawConsole = false
@@ -250,8 +251,8 @@ final class BootProgress {
         case "cursor-pos":
             let f = line.split(separator: " ", omittingEmptySubsequences: true)
             guard f.count >= 5, let x = Int(f[1]), let y = Int(f[2]),
-                  let rw = Int(f[3]), let rh = Int(f[4]), rw > 0, rh > 0 else { return }
-            onCursorPosition?(x, y, rw, rh)
+                  let w = Int(f[3]), let h = Int(f[4]), w > 0, h > 0 else { return }
+            onCursorPosition?(x, y, w, h)
         case "profiles-ok":
             guard parts.count == 3, parts[1].count == 64,
                   parts[1].allSatisfy({ $0.isHexDigit }), ["applied", "pending"].contains(parts[2]) else { return }

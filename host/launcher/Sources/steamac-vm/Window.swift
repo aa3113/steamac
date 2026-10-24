@@ -375,9 +375,9 @@ final class WindowController: NSObject, NSWindowDelegate {
             self?.view.guestCursorImage(width: w, height: h, xhot: xhot, yhot: yhot, bgra: bgra)
         }
         let previousCursorPosition = progress.onCursorPosition
-        progress.onCursorPosition = { [weak self] x, y, rw, rh in
-            previousCursorPosition?(x, y, rw, rh)
-            self?.view.guestCursorPosition(x: x, y: y, rootWidth: rw, rootHeight: rh)
+        progress.onCursorPosition = { [weak self] x, y, w, h in
+            previousCursorPosition?(x, y, w, h)
+            self?.view.guestCursorPosition(x: x, y: y, windowWidth: w, windowHeight: h)
         }
         let previousReady = progress.onReady
         progress.onReady = { [weak self] in previousReady?(); self?.overlay.hide() }

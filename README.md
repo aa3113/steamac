@@ -1179,15 +1179,18 @@ agent (`guest/progress-agent/src/cursor.rs`) finds the Xwayland display whose ac
 starts with `steam_app_` (any XFixes-capable display otherwise), follows the pointer with
 `QueryPointer` every 16 ms while a game has focus, fetches the bitmap with `XFixesGetCursorImage`
 every 50 ms, and sends only changes: `cursor 0|1`, `cursor-image <w> <h> <xhot> <yhot> <base64 BGRA>`,
-and `cursor-pos <x> <y> <root_w> <root_h>`. A 1×1 or fully transparent cursor is hidden, as Wine uses
-for a game without a cursor.
+and `cursor-pos <x> <y> <win_w> <win_h>`. The position and size are in the focused game's X window
+client pixels, not the X root: a windowed game's root can be larger than its client area. A 1×1 or
+fully transparent cursor is hidden, as Wine uses for a game without a cursor.
 
 The launcher parses these in `Progress.swift` and forwards them through `Window.swift` to `VMView` in
 `Presenter.swift`, which owns a transparent `CALayer` named `steamac.cursor-overlay` at `zPosition`
 1000. It is shown only while a game layer is visible and the guest cursor is visible and its position
 is known; it is excluded from the game-layer and Metal HUD policies and re-attached if wmtr removes
-sublayers. The bitmap becomes a premultiplied-first `CGImage`; the layer carries it at the X root
-position scaled into the same fitted rectangle as the guest picture, and the compositor does the
+sublayers. The bitmap becomes a premultiplied-first `CGImage`. The layer maps the X window position
+into the active remoted game layer's displayed drawable rectangle (`drawableSize` aspect-fit into the
+layer, the same geometry wmtr gives that layer), not into the guest picture, so a game layer whose
+size or aspect differs from the guest scanout does not shift the cursor. The compositor does the
 scaling and alpha blending. This keeps the game visible and preserves the game's own cursor shape,
 hotspot, and visibility.
 
