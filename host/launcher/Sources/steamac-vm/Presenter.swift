@@ -77,6 +77,51 @@ final class Presenter: DisplaySink {
 final class VMView: NSView {
     let renderer: Renderer
     let metalLayer = CAMetalLayer()
+    /// Transparent image layer above remoted game layers (DXMT), carrying only the X cursor.
+    /// Hidden on the Vulkan path and while the game hides its cursor.
+    private let cursorLayer = CALayer()
+    static let cursorLayerName = "steamac.cursor-overlay"
+    private struct CursorGlyph {
+        let image: CGImage
+        let xhot: Int
+        let yhot: Int
+    }
+    /// The focused game's cursor, forwarded by the progress agent (`cursor`, `cursor-image`,
+    /// `cursor-pos`). Position and root size are in the game's Xwayland pixels.
+    private var guestCursorVisible = false
+    private var guestCursorPosition: (x: Int, y: Int)?
+    private var guestCursorRoot: (width: Int, height: Int)?
+    private var guestCursorGlyph: CursorGlyph?
+    /// X cursor bitmaps are small; cap guest input before multiplying dimensions.
+    private static let maxCursorDimension = 256
+
+    func guestCursorVisibility(_ visible: Bool) {
+        guestCursorVisible = visible
+        updateCursorLayer()
+    }
+
+    func guestCursorImage(width: Int, height: Int, xhot: Int, yhot: Int, bgra: Data) {
+        guard width > 0, height > 0, width <= Self.maxCursorDimension, height <= Self.maxCursorDimension else { return }
+        let (area, areaOverflow) = width.multipliedReportingOverflow(by: height)
+        let (bytes, bytesOverflow) = area.multipliedReportingOverflow(by: 4)
+        guard !areaOverflow, !bytesOverflow, bytes == bgra.count,
+              let provider = CGDataProvider(data: bgra as CFData),
+              let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                                  bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGBitmapInfo.byteOrder32Little.union(
+                                      CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)),
+                                  provider: provider, decode: nil, shouldInterpolate: false,
+                                  intent: .defaultIntent) else { return }
+        guestCursorGlyph = CursorGlyph(image: image, xhot: max(0, min(xhot, width)),
+                                       yhot: max(0, min(yhot, height)))
+        updateCursorLayer()
+    }
+
+    func guestCursorPosition(x: Int, y: Int, rootWidth: Int, rootHeight: Int) {
+        guestCursorPosition = (x, y)
+        guestCursorRoot = (rootWidth, rootHeight)
+        updateCursorLayer()
+    }
     /// Fallback geometry for pointer mapping before the first frame.
     var contentPixelSize: CGSize
     weak var controller: WindowController?
@@ -94,6 +139,17 @@ final class VMView: NSView {
         metalLayer.displaySyncEnabled = true
         metalLayer.allowsNextDrawableTimeout = true
         metalLayer.backgroundColor = NSColor.black.cgColor
+        cursorLayer.isOpaque = false
+        cursorLayer.backgroundColor = NSColor.clear.cgColor
+        cursorLayer.name = Self.cursorLayerName
+        cursorLayer.zPosition = 1000   // above the remoted game CAMetalLayers, whatever their order
+        cursorLayer.isHidden = true
+        cursorLayer.contentsGravity = .resize
+        cursorLayer.magnificationFilter = .nearest
+        cursorLayer.minificationFilter = .nearest
+        cursorLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        cursorLayer.frame = bounds
+        metalLayer.addSublayer(cursorLayer)
         wantsLayer = true
         layerContentsRedrawPolicy = .never
         renderer.onFirstOnScreen = { [weak self] in
@@ -138,15 +194,59 @@ final class VMView: NSView {
     private func updateDrawableSize() {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
         metalLayer.contentsScale = scale
+        cursorLayer.contentsScale = scale
         let size = CGSize(width: (bounds.width * scale).rounded(), height: (bounds.height * scale).rounded())
         if size != metalLayer.drawableSize && size.width > 0 && size.height > 0 {
             metalLayer.drawableSize = size
+            cursorLayer.frame = bounds
             redraw()
         }
     }
 
+    /// A remoted game layer is present (DXMT): it would cover the guest's cursor.
+    private var hasGameLayer: Bool {
+        (metalLayer.sublayers ?? []).contains { $0 is CAMetalLayer && $0.name != Self.cursorLayerName }
+    }
+
+    /// The cursor layer is a child of `metalLayer`; a plain CALayer survives wmtr removing its
+    /// CAMetalLayer children, but re-attach it anyway if that ever changes.
+    private func updateCursorLayer() {
+        guard let position = guestCursorPosition, let root = guestCursorRoot, root.width > 0, root.height > 0,
+              let glyph = guestCursorGlyph, let content = renderer.texture else {
+            cursorLayer.isHidden = true
+            return
+        }
+        let show = gameLayersVisible && hasGameLayer && guestCursorVisible
+        if show, cursorLayer.superlayer !== metalLayer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            metalLayer.addSublayer(cursorLayer)
+            CATransaction.commit()
+        }
+        let fit = Renderer.fit(content: CGSize(width: content.width, height: content.height), in: metalLayer.bounds)
+        let sx = fit.width / CGFloat(root.width), sy = fit.height / CGFloat(root.height)
+        let w = CGFloat(glyph.image.width) * sx, h = CGFloat(glyph.image.height) * sy
+        let left = fit.minX + (CGFloat(position.x) - CGFloat(glyph.xhot)) * sx
+        let top = fit.minY + (CGFloat(position.y) - CGFloat(glyph.yhot)) * sy
+        // X root Y grows downward; a CALayer child uses the parent's (bottom-left) Y unless flipped.
+        let y = metalLayer.isGeometryFlipped ? top : metalLayer.bounds.maxY - top - h
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        cursorLayer.isHidden = !show
+        if show {
+            cursorLayer.zPosition = 1000
+            cursorLayer.frame = CGRect(x: left.rounded(), y: y.rounded(),
+                                       width: w.rounded(), height: h.rounded())
+            cursorLayer.contents = glyph.image
+        }
+        CATransaction.commit()
+    }
+
     /// `flushedAt`: the guest flush time of a new frame (perf stats), 0 for a plain redraw.
-    func redraw(flushedAt: CFTimeInterval = 0) { renderer.draw(to: metalLayer, flushedAt: flushedAt) }
+    func redraw(flushedAt: CFTimeInterval = 0) {
+        renderer.draw(to: metalLayer, flushedAt: flushedAt)
+        updateCursorLayer()
+    }
 
     /// Remoted game layers (wmtr with WMTR_PRESENT=overlay) cover the guest picture only while a
     /// game has the guest's focus, leaving Steam and the desktop visible otherwise. The executor
@@ -155,13 +255,16 @@ final class VMView: NSView {
         didSet {
             Self.applyGameLayers(visible: gameLayersVisible, in: metalLayer)
             Self.applyHUD(metalHUD, gameVisible: gameLayersVisible, main: metalLayer, mainAttached: hudAttached)
+            updateCursorLayer()
         }
     }
 
     static func applyGameLayers(visible: Bool, in parent: CALayer) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for layer in parent.sublayers ?? [] where layer is CAMetalLayer { layer.isHidden = !visible }
+        for layer in parent.sublayers ?? [] where layer is CAMetalLayer && layer.name != cursorLayerName {
+            layer.isHidden = !visible
+        }
         CATransaction.commit()
     }
 
@@ -177,9 +280,10 @@ final class VMView: NSView {
     /// Keep the HUD on the game layers while shown, otherwise on the guest picture. Game layers
     /// get "default" first so "off" is a change even when libMTLHud attached with its HUD showing.
     static func applyHUD(_ on: Bool, gameVisible: Bool, main: CAMetalLayer, mainAttached: Bool) {
-        let onGame = on && gameVisible && (main.sublayers?.contains { $0 is CAMetalLayer } ?? false)
+        let game = (main.sublayers ?? []).compactMap { $0 as? CAMetalLayer }.filter { $0.name != cursorLayerName }
+        let onGame = on && gameVisible && !game.isEmpty
         if mainAttached { main.developerHUDProperties = ["mode": on && !onGame ? "default" : "off"] }
-        for case let layer as CAMetalLayer in main.sublayers ?? [] {
+        for layer in game {
             layer.developerHUDProperties = ["mode": "default"]
             if !onGame { layer.developerHUDProperties = ["mode": "off"] }
         }
