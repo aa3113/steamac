@@ -5,9 +5,14 @@
 #
 #   ./build.sh            host stack, guest kernel, guest Venus Mesa, disk image
 #   ./build.sh host       only the macOS side (MoltenVK, KosmicKrisp on macOS 26+, libepoxy,
-#                         virglrenderer, libkrun, launcher)
+#                         virglrenderer, libkrun, launcher); KosmicKrisp's probe/repro checks are
+#                         skipped by default
 #   ./build.sh guest      only the guest side (kernel, rootfs, Mesa, initramfs, layer, disk)
 #   ./build.sh dxmt       DXMT host executor + guest dlls/unixlib (requires Rosetta and linux/amd64 Docker)
+#
+#   RUN_KK_TESTS=1        with host/all: run KosmicKrisp's host probe/repro checks (skipped by
+#                         default). A direct host/kosmickrisp/build.sh still runs them unless
+#                         SKIP_KK_TESTS=1 is set.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -15,7 +20,11 @@ host() {
     host/moltenvk/build.sh
     # KosmicKrisp needs Metal 4 (macOS 26+); without it the app offers MoltenVK only.
     if (($(sw_vers -productVersion | cut -d. -f1) >= 26)); then
-        host/kosmickrisp/build.sh
+        if [[ ${RUN_KK_TESTS:-0} == 1 ]]; then
+            SKIP_KK_TESTS=0 host/kosmickrisp/build.sh
+        else
+            SKIP_KK_TESTS=1 host/kosmickrisp/build.sh
+        fi
     else
         echo "KosmicKrisp skipped: needs macOS 26 or newer" >&2
     fi

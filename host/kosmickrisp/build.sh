@@ -3,6 +3,7 @@
 #
 #   host/kosmickrisp/build.sh        build/refresh work/out/host/lib/libvulkan_kosmickrisp.dylib
 #   host/kosmickrisp/build.sh clean  drop the source/build tree (next build is from scratch)
+#   SKIP_KK_TESTS=1 host/kosmickrisp/build.sh   build/install without the probe/repro checks
 #
 # Needs macOS 26+ on Apple silicon (Metal 4); ./build.sh host skips it on older macOS. MoltenVK
 # (host/moltenvk) stays the default driver; the launcher selects KosmicKrisp with
@@ -257,6 +258,9 @@
 # host/moltenvk/repro (REPRO_DRIVER=kosmickrisp), both through the Khronos loader (Homebrew
 # vulkan-loader, test only).
 #
+# SKIP_KK_TESTS=1 skips the probe and repro checks below; the dylib is still built, staged,
+# signed and installed. Use it for quick builds when the driver itself did not change.
+#
 # Output (work/out/host):
 #   lib/libvulkan_kosmickrisp.dylib   install_name @rpath/libvulkan_kosmickrisp.dylib, ad-hoc signed.
 #                                     Exports only the loader-ICD interface (vk_icd*);
@@ -264,6 +268,8 @@
 #   KOSMICKRISP.txt                   provenance (Mesa commit, patches, patch revision)
 # Installed by temp file + rename (a running VM may have the old dylib mapped).
 set -eu
+
+skip_tests=${SKIP_KK_TESTS:-0}
 
 MESA_REPO=https://gitlab.freedesktop.org/mesa/mesa.git
 MESA_COMMIT=ce576c29ed90822ea15564e1e60cb48e455881bb
@@ -364,20 +370,24 @@ nm -gU "$staged" | grep -q ' _vk_icdGetInstanceProcAddr$'
 codesign --force -s - "$staged"
 
 # --- probe + repros on the staged dylib (Khronos loader, test only)
-icd=$work/stage/kosmickrisp_icd.json
-printf '{"file_format_version": "1.0.1", "ICD": {"library_path": "%s", "api_version": "1.4.0"}}\n' \
-	"$staged" > "$icd"
-loader=$(brew --prefix vulkan-loader)/lib
-probe=$work/probe
-xcrun clang -std=c11 -Wall -Werror -O1 -I"$root/work/build/host-moltenvk/src/Package/Release/MoltenVK/include" \
-	"$root/host/moltenvk/probe/probe.c" -L"$loader" -lvulkan -Wl,-rpath,"$loader" -o "$probe"
-echo ">> probe: $staged"
-VK_DRIVER_FILES=$icd "$probe"
-echo ">> repro (REPRO_DRIVER=kosmickrisp)"
-repro_log=$work/repro.log
-REPRO_DRIVER=kosmickrisp "$root/host/moltenvk/repro/run.sh" "$staged" > "$repro_log" 2>&1 ||
-	{ cat "$repro_log"; exit 1; }
-grep -v '^	' "$repro_log" | grep -v 'Metal API Validation Enabled'
+if [ "$skip_tests" = 1 ]; then
+	echo ">> probe/repro skipped (SKIP_KK_TESTS=1)" >&2
+else
+	icd=$work/stage/kosmickrisp_icd.json
+	printf '{"file_format_version": "1.0.1", "ICD": {"library_path": "%s", "api_version": "1.4.0"}}\n' \
+		"$staged" > "$icd"
+	loader=$(brew --prefix vulkan-loader)/lib
+	probe=$work/probe
+	xcrun clang -std=c11 -Wall -Werror -O1 -I"$root/work/build/host-moltenvk/src/Package/Release/MoltenVK/include" \
+		"$root/host/moltenvk/probe/probe.c" -L"$loader" -lvulkan -Wl,-rpath,"$loader" -o "$probe"
+	echo ">> probe: $staged"
+	VK_DRIVER_FILES=$icd "$probe"
+	echo ">> repro (REPRO_DRIVER=kosmickrisp)"
+	repro_log=$work/repro.log
+	REPRO_DRIVER=kosmickrisp "$root/host/moltenvk/repro/run.sh" "$staged" > "$repro_log" 2>&1 ||
+		{ cat "$repro_log"; exit 1; }
+	grep -v '^	' "$repro_log" | grep -v 'Metal API Validation Enabled'
+fi
 
 # --- install (temp + rename, never rewrite a mapped dylib in place)
 mkdir -p "$out/lib"
@@ -392,7 +402,11 @@ mv -f "$lib.tmp.$$" "$lib"
 	echo "source:          $MESA_REPO"
 	echo "commit:          $MESA_COMMIT (main, 2026-10-05)"
 	echo "patch revision:  $patch_rev (sha256 of host/kosmickrisp/patches/*.patch)"
-	echo "driver:          $(VK_DRIVER_FILES=$icd "$probe" 2> /dev/null | sed -n 's/^driver: *//p')"
+	if [ "$skip_tests" = 1 ]; then
+		echo "driver:          not checked (SKIP_KK_TESTS=1)"
+	else
+		echo "driver:          $(VK_DRIVER_FILES=$icd "$probe" 2> /dev/null | sed -n 's/^driver: *//p')"
+	fi
 	echo "Xcode:           $(xcodebuild -version | tr '\n' ' ')"
 	echo "built:           $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	echo
